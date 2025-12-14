@@ -39,6 +39,13 @@ except ImportError:
         "pip install torch-geometric などでインストールしてください。"
     )
 
+# torch 1.13 以前の ModuleDict には .get() が無い実装があるため、安全のために polyfill を入れておく
+if not hasattr(nn.ModuleDict, "get"):
+    def _module_dict_get(self, key, default=None):
+        return self._modules.get(key, default)
+
+    nn.ModuleDict.get = _module_dict_get  # type: ignore[attr-defined]
+
 # ------------------------------------------------------------
 # 設定
 # ------------------------------------------------------------
@@ -69,9 +76,16 @@ CACHE_DIR = ".cache"      # キャッシュファイルの保存先ディレク�
 
 LAMBDA_DATA = 0.1
 LAMBDA_PDE  = 0.0001
+LAMBDA_LAPLACIAN = 0.0001  # オートディファレンスで計算したラプラシアン損失の重み
+LAMBDA_BC = 0.01  # 境界条件損失（WALL_FACES 利用）の重み
 LAMBDA_GAUGE = 0.01  # ゲージ正則化係数（教師なし学習時の定数モード抑制用）
 
 W_PDE_MAX = 10.0  # w_pde の最大値
+
+# オートディファレンスでのラプラシアン損失を有効化するかどうか
+USE_AUTODIFF_LAPLACIAN_LOSS = False
+# WALL_FACES による境界条件損失を有効化するかどうか
+USE_BC_LOSS = True
 
 EPS_DATA = 1e-12  # データ損失用 eps
 EPS_RES  = 1e-12  # 残差正規化用 eps
@@ -358,6 +372,7 @@ def load_case_with_csr(gnn_dir: str, time_str: str, rank_str: str):
 
     cell_lines = lines[idx_cells + 1: idx_edges]
     edge_lines = lines[idx_edges + 1: idx_wall]
+    wall_lines = lines[idx_wall:]
 
     if len(cell_lines) != nCells:
         log_print(f"[WARN] nCells={nCells} と CELLS 行数={len(cell_lines)} が異なります (time={time_str}).")
@@ -419,6 +434,40 @@ def load_case_with_csr(gnn_dir: str, time_str: str, rank_str: str):
         np.array(e_src, dtype=np.int64),
         np.array(e_dst, dtype=np.int64)
     ])
+
+    # WALL_FACES セクション（境界条件）をパース
+    wall_bc_cells = []
+    wall_bc_values = []
+    wall_bc_weights = []
+    for ln in wall_lines:
+        parts = ln.split()
+        if not parts or parts[0] != "WALL_FACES":
+            continue
+
+        if len(parts) < 2:
+            log_print(f"[WARN] WALL_FACES 行の列数が不足しています: {ln}")
+            continue
+
+        try:
+            cell_id = int(parts[1])
+        except ValueError:
+            log_print(f"[WARN] WALL_FACES の cell_id を解釈できません: {ln}")
+            continue
+
+        if not (0 <= cell_id < len(cell_lines)):
+            log_print(f"[WARN] WALL_FACES の cell_id が範囲外です: {cell_id}")
+            continue
+
+        bc_val = float(parts[2]) if len(parts) >= 3 else 0.0
+        bc_weight = float(parts[3]) if len(parts) >= 4 else 1.0
+
+        wall_bc_cells.append(cell_id)
+        wall_bc_values.append(bc_val)
+        wall_bc_weights.append(bc_weight)
+
+    wall_bc_index_np = np.array(wall_bc_cells, dtype=np.int64)
+    wall_bc_value_np = np.array(wall_bc_values, dtype=np.float32)
+    wall_bc_weight_np = np.array(wall_bc_weights, dtype=np.float32)
 
     # x ファイルが存在する場合のみ読み込み（教師あり学習）
     # 存在しない場合は None（教師なし学習 / PINNs モード）
@@ -506,6 +555,9 @@ def load_case_with_csr(gnn_dir: str, time_str: str, rank_str: str):
         "col_ind_np": col_ind_np,
         "vals_np": vals_np,
         "row_idx_np": row_idx_np,
+        "wall_bc_index_np": wall_bc_index_np,
+        "wall_bc_value_np": wall_bc_value_np,
+        "wall_bc_weight_np": wall_bc_weight_np,
     }
 
 # ------------------------------------------------------------
@@ -545,6 +597,66 @@ def matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x):
     y = torch.zeros_like(x)
     y.index_add_(0, row_idx, vals * x[col_ind])
     return y
+
+# ------------------------------------------------------------
+# オートディファレンスによるラプラシアン損失
+# ------------------------------------------------------------
+
+def compute_autodiff_laplacian_loss(x_pred: torch.Tensor,
+                                    coords: torch.Tensor,
+                                    b: torch.Tensor,
+                                    weight: torch.Tensor) -> torch.Tensor:
+    """
+    予測値 x_pred に対して、座標に対するオートディファレンスでラプラシアンを計算し、
+    RHS (b) との差を相対残差²として返す。
+
+    Parameters
+    ----------
+    x_pred : torch.Tensor
+        予測スカラー場（形状: [N]）
+    coords : torch.Tensor
+        座標特徴（形状: [N, 3]）。requires_grad=True である必要がある。
+    b : torch.Tensor
+        PDE の RHS ベクトル（形状: [N]）
+    weight : torch.Tensor
+        PDE 重み（形状: [N]）。w_pde を想定。
+    """
+
+    # 1次導関数
+    grad = torch.autograd.grad(
+        outputs=x_pred,
+        inputs=coords,
+        grad_outputs=torch.ones_like(x_pred),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+
+    # 2次導関数（各軸の 2階微分の和 = ラプラシアン）
+    laplacian_terms = []
+    for i in range(grad.shape[1]):
+        grad_i = grad[:, i]
+        second_deriv = torch.autograd.grad(
+            outputs=grad_i,
+            inputs=coords,
+            grad_outputs=torch.ones_like(grad_i),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0][:, i]
+        laplacian_terms.append(second_deriv)
+
+    laplacian = torch.stack(laplacian_terms, dim=1).sum(dim=1)
+
+    # ラプラシアン - b を相対残差²で評価
+    residual = laplacian - b
+    sqrt_w = torch.sqrt(weight)
+    wr = sqrt_w * residual
+    wb = sqrt_w * b
+    norm_wr = torch.norm(wr)
+    norm_wb = torch.norm(wb) + EPS_RES
+    R_laplace = norm_wr / norm_wb
+    return R_laplace * R_laplace
 
 # ------------------------------------------------------------
 # メッシュ品質 w_pde
@@ -604,6 +716,9 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
     feats_np  = rc["feats_np"]
     x_true_np = rc["x_true_np"]
     has_x_true = rc.get("has_x_true", x_true_np is not None)
+    wall_bc_index_np = rc.get("wall_bc_index_np", np.array([], dtype=np.int64))
+    wall_bc_value_np = rc.get("wall_bc_value_np", np.array([], dtype=np.float32))
+    wall_bc_weight_np = rc.get("wall_bc_weight_np", np.array([], dtype=np.float32))
 
     feats_norm = (feats_np - feat_mean) / feat_std
 
@@ -638,6 +753,16 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
 
     w_pde = torch.from_numpy(w_pde_np).float().to(target_device)
 
+    # 境界条件（WALL_FACES）
+    if wall_bc_index_np.size > 0:
+        wall_bc_index = torch.from_numpy(wall_bc_index_np).long().to(target_device)
+        wall_bc_value = torch.from_numpy(wall_bc_value_np).float().to(target_device)
+        wall_bc_weight = torch.from_numpy(wall_bc_weight_np).float().to(target_device)
+    else:
+        wall_bc_index = None
+        wall_bc_value = None
+        wall_bc_weight = None
+
     return {
         "time": rc["time"],
         "rank": rc["rank"],
@@ -654,6 +779,9 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
         "row_idx": row_idx,
         "w_pde": w_pde,
         "w_pde_np": w_pde_np,  # ★ 分布ログ用に numpy を保持しておく
+        "wall_bc_index": wall_bc_index,
+        "wall_bc_value": wall_bc_value,
+        "wall_bc_weight": wall_bc_weight,
 
         # ★ 誤差場可視化用に元の座標・品質指標も持たせる
         "coords_np": feats_np[:, 0:3].copy(),   # [x, y, z]
@@ -673,6 +801,9 @@ def move_case_to_device(cs, device):
     x_true = cs["x_true"]
     x_true_norm = cs["x_true_norm"]
     has_x_true = cs.get("has_x_true", x_true is not None)
+    wall_bc_index = cs.get("wall_bc_index")
+    wall_bc_value = cs.get("wall_bc_value")
+    wall_bc_weight = cs.get("wall_bc_weight")
 
     return {
         "time": cs["time"],
@@ -690,6 +821,9 @@ def move_case_to_device(cs, device):
         "row_idx": cs["row_idx"].to(device, non_blocking=True),
         "w_pde": cs["w_pde"].to(device, non_blocking=True),
         "w_pde_np": cs["w_pde_np"],
+        "wall_bc_index": wall_bc_index.to(device, non_blocking=True) if wall_bc_index is not None else None,
+        "wall_bc_value": wall_bc_value.to(device, non_blocking=True) if wall_bc_value is not None else None,
+        "wall_bc_weight": wall_bc_weight.to(device, non_blocking=True) if wall_bc_weight is not None else None,
         "coords_np": cs["coords_np"],
         "skew_np": cs["skew_np"],
         "non_ortho_np": cs["non_ortho_np"],
@@ -1217,6 +1351,8 @@ def train_gnn_auto_trainval_pde_weighted(
         "loss": [],
         "data_loss": [],
         "pde_loss": [],
+        "laplacian_loss": [],  # オートディファレンス損失
+        "bc_loss": [],  # WALL_FACES を用いた境界条件損失
         "gauge_loss": [],  # ゲージ損失（教師なし学習時のみ）
         "rel_err_train": [],
         "rel_err_val": [],  # val が無いときは None
@@ -1229,6 +1365,8 @@ def train_gnn_auto_trainval_pde_weighted(
 
         total_data_loss = 0.0
         total_pde_loss  = 0.0
+        total_laplacian_loss = torch.tensor(0.0, device=device)
+        total_bc_loss = torch.tensor(0.0, device=device)
         total_gauge_loss = 0.0  # ゲージ損失（教師なし学習時の定数モード抑制用）
         sum_rel_err_tr  = 0.0
         sum_R_pred_tr   = 0.0
@@ -1252,12 +1390,21 @@ def train_gnn_auto_trainval_pde_weighted(
             vals        = cs_gpu["vals"]
             row_idx     = cs_gpu["row_idx"]
             w_pde       = cs_gpu["w_pde"]
+            wall_bc_index = cs_gpu.get("wall_bc_index")
+            wall_bc_value = cs_gpu.get("wall_bc_value")
+            wall_bc_weight = cs_gpu.get("wall_bc_weight")
             has_x_true  = cs_gpu.get("has_x_true", x_true is not None)
+
+            # ラプラシアン損失用に座標へ勾配を通す（必要なときのみ）
+            if USE_AUTODIFF_LAPLACIAN_LOSS:
+                feats_for_model = cs_gpu["feats"].detach().clone().requires_grad_(True)
+            else:
+                feats_for_model = feats
 
             # AMP: autocast で順伝播と損失計算を FP16/BF16 で実行
             with torch.cuda.amp.autocast(enabled=use_amp_actual):
                 # モデルは正規化スケールで出力
-                x_pred_norm = model(feats, edge_index)
+                x_pred_norm = model(feats_for_model, edge_index)
                 # 非正規化スケールに戻す
                 x_pred = x_pred_norm * x_std_t + x_mean_t
 
@@ -1294,13 +1441,30 @@ def train_gnn_auto_trainval_pde_weighted(
                 R_pred = norm_wr / norm_wb
                 pde_loss_case = R_pred * R_pred
 
+                # オートディファレンスによるラプラシアン損失
+                if USE_AUTODIFF_LAPLACIAN_LOSS:
+                    laplacian_loss_case = compute_autodiff_laplacian_loss(
+                        x_pred, feats_for_model[:, 0:3], b, w_pde
+                    )
+                else:
+                    laplacian_loss_case = torch.tensor(0.0, device=device)
+
                 # ゲージ損失: x_pred の平均値の二乗（教師なし学習時の定数モード抑制用）
                 # 圧力ポアソン方程式の解は定数の不定性（ゲージ自由度）があるため、
                 # 平均ゼロに近づけることで解を一意に定める
                 gauge_loss_case = torch.mean(x_pred) ** 2
 
+                # 境界条件損失（WALL_FACES）: Dirichlet を想定し、重み付き MSE
+                if USE_BC_LOSS and wall_bc_index is not None and wall_bc_index.numel() > 0:
+                    bc_diff = x_pred[wall_bc_index] - wall_bc_value
+                    bc_loss_case = torch.mean(wall_bc_weight * bc_diff * bc_diff)
+                else:
+                    bc_loss_case = torch.tensor(0.0, device=device)
+
             total_data_loss = total_data_loss + data_loss_case
             total_pde_loss  = total_pde_loss  + pde_loss_case
+            total_laplacian_loss = total_laplacian_loss + laplacian_loss_case
+            total_bc_loss = total_bc_loss + bc_loss_case
             total_gauge_loss = total_gauge_loss + gauge_loss_case
 
             with torch.no_grad():
@@ -1327,16 +1491,30 @@ def train_gnn_auto_trainval_pde_weighted(
 
         # 損失の計算（教師なし学習の場合は PDE 損失 + ゲージ損失）
         total_pde_loss = total_pde_loss / num_train
+        if USE_AUTODIFF_LAPLACIAN_LOSS:
+            total_laplacian_loss = total_laplacian_loss / num_train
+        if USE_BC_LOSS:
+            total_bc_loss = total_bc_loss / num_train
         total_gauge_loss = total_gauge_loss / num_train
+        laplacian_term = (
+            LAMBDA_LAPLACIAN * total_laplacian_loss
+            if USE_AUTODIFF_LAPLACIAN_LOSS
+            else torch.tensor(0.0, device=device)
+        )
+        bc_term = (
+            LAMBDA_BC * total_bc_loss
+            if USE_BC_LOSS
+            else torch.tensor(0.0, device=device)
+        )
         if unsupervised_mode or num_cases_with_x == 0:
             # 教師なし学習: PDE 損失 + ゲージ正則化
             # ゲージ正則化は圧力ポアソンの定数モード（ゲージ自由度）を抑制
             total_data_loss = torch.tensor(0.0, device=device)
-            loss = LAMBDA_PDE * total_pde_loss + LAMBDA_GAUGE * total_gauge_loss
+            loss = LAMBDA_PDE * total_pde_loss + laplacian_term + bc_term + LAMBDA_GAUGE * total_gauge_loss
         else:
             # 教師あり学習: データ損失 + PDE 損失（ゲージ正則化は不要、x_true が定数モードを固定）
             total_data_loss = total_data_loss / num_cases_with_x
-            loss = LAMBDA_DATA * total_data_loss + LAMBDA_PDE * total_pde_loss
+            loss = LAMBDA_DATA * total_data_loss + LAMBDA_PDE * total_pde_loss + laplacian_term + bc_term
 
         # AMP: スケーリングされた勾配で逆伝播
         scaler.scale(loss).backward()
@@ -1511,6 +1689,8 @@ def train_gnn_auto_trainval_pde_weighted(
             history["loss"].append(loss.item())
             history["data_loss"].append((LAMBDA_DATA * total_data_loss).item())
             history["pde_loss"].append((LAMBDA_PDE * total_pde_loss).item())
+            history["laplacian_loss"].append(laplacian_term.item())
+            history["bc_loss"].append(bc_term.item())
             history["gauge_loss"].append((LAMBDA_GAUGE * total_gauge_loss).item())
             history["rel_err_train"].append(avg_rel_err_tr)
             history["rel_err_val"].append(avg_rel_err_val)  # None の可能性あり
@@ -1526,6 +1706,10 @@ def train_gnn_auto_trainval_pde_weighted(
                 f"data_loss={LAMBDA_DATA * total_data_loss:.4e}, "
                 f"PDE_loss={LAMBDA_PDE * total_pde_loss:.4e}, "
             )
+            if USE_AUTODIFF_LAPLACIAN_LOSS:
+                log += f"laplacian_loss={laplacian_term:.4e}, "
+            if USE_BC_LOSS:
+                log += f"bc_loss={bc_term:.4e}, "
             if unsupervised_mode or num_cases_with_x == 0:
                 # 教師なし学習: ゲージ損失も表示
                 log += f"gauge_loss={LAMBDA_GAUGE * total_gauge_loss:.4e}, "
