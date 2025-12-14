@@ -80,6 +80,20 @@ LAMBDA_LAPLACIAN = 0.0001  # オートディファレンスで計算したラプ
 LAMBDA_BC = 0.01  # 境界条件損失（WALL_FACES 利用）の重み
 LAMBDA_GAUGE = 0.01  # ゲージ正則化係数（教師なし学習時の定数モード抑制用）
 
+# マルチスケール学習用設定
+NUM_SCALES = 3
+SCALE_LABELS = ["coarse", "mid", "fine"]
+SCALE_WEIGHTS = [1.0, 1.0, 1.0]
+LAMBDA_PDE_COARSE = LAMBDA_PDE
+LAMBDA_PDE_MID = LAMBDA_PDE
+LAMBDA_PDE_FINE = LAMBDA_PDE
+LAMBDA_DATA_COARSE = LAMBDA_DATA
+LAMBDA_DATA_MID = LAMBDA_DATA
+LAMBDA_DATA_FINE = LAMBDA_DATA
+LAMBDA_BC_COARSE = LAMBDA_BC
+LAMBDA_BC_MID = LAMBDA_BC
+LAMBDA_BC_FINE = LAMBDA_BC
+
 W_PDE_MAX = 10.0  # w_pde の最大値
 
 # オートディファレンスでのラプラシアン損失を有効化するかどうか
@@ -564,6 +578,43 @@ def load_case_with_csr(gnn_dir: str, time_str: str, rank_str: str):
 # GNN
 # ------------------------------------------------------------
 
+def get_scale_labels(num_scales: int):
+    base = SCALE_LABELS
+    if num_scales <= len(base):
+        return base[:num_scales]
+    extra = [f"scale{i+1}" for i in range(num_scales - len(base))]
+    return base + extra
+
+
+def parse_scale_weights(weight_str: str, num_scales: int):
+    weights = [float(w) for w in weight_str.split(",") if w]
+    if len(weights) != num_scales:
+        raise ValueError(
+            f"--scale-weights は {num_scales} 個のカンマ区切り値が必要です (例: 1.0,0.5,1.0)"
+        )
+    return weights
+
+
+def get_default_head_configs(num_scales: int, hidden_channels: int):
+    default = [
+        {"label": "coarse", "downsample_factor": 4, "mlp_depth": 2},
+        {"label": "mid", "downsample_factor": 2, "mlp_depth": 3},
+        {"label": "fine", "downsample_factor": 1, "mlp_depth": 4},
+    ]
+    head_configs = default[:num_scales]
+    while len(head_configs) < num_scales:
+        head_configs.append(
+            {
+                "label": f"scale{len(head_configs)+1}",
+                "downsample_factor": 1,
+                "mlp_depth": 2,
+            }
+        )
+    for cfg in head_configs:
+        cfg["hidden_channels"] = max(1, hidden_channels // cfg["downsample_factor"])
+    return head_configs
+
+
 class SimpleSAGE(nn.Module):
     def __init__(
         self,
@@ -572,6 +623,7 @@ class SimpleSAGE(nn.Module):
         num_layers: int = 4,
         use_residual: bool = False,
         residual_proj: bool = True,
+        output_dim: int = 1,
     ):
         super().__init__()
         self.use_residual = use_residual
@@ -580,7 +632,7 @@ class SimpleSAGE(nn.Module):
         self.res_proj = nn.ModuleDict()
 
         in_dims = [in_channels] + [hidden_channels] * (num_layers - 1)
-        out_dims = [hidden_channels] * (num_layers - 1) + [1]
+        out_dims = [hidden_channels] * (num_layers - 1) + [output_dim]
 
         for idx, (in_dim, out_dim) in enumerate(zip(in_dims, out_dims)):
             self.convs.append(SAGEConv(in_dim, out_dim))
@@ -606,7 +658,9 @@ class SimpleSAGE(nn.Module):
             x = self._apply_residual(x, residual, i)
             if i != len(self.convs) - 1:
                 x = F.relu(x)
-        return x.view(-1)
+        if x.shape[1] == 1:
+            return x.view(-1)
+        return x
 
 
 class SimpleMLP(nn.Module):
@@ -652,6 +706,63 @@ class SimpleMLP(nn.Module):
             if i != len(self.layers) - 1:
                 x = F.relu(x)
         return x.view(-1)
+
+
+class MultiScaleHead(nn.Module):
+    def __init__(self, in_channels: int, hidden_channels: int, mlp_depth: int):
+        super().__init__()
+        layers = []
+        dim = in_channels
+        for i in range(max(1, mlp_depth - 1)):
+            layers.append(nn.Linear(dim, hidden_channels))
+            layers.append(nn.ReLU())
+            dim = hidden_channels
+        layers.append(nn.Linear(dim, 1))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.mlp(x).view(-1)
+
+
+class MultiScaleSAGE(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int = 64,
+        num_layers: int = 4,
+        num_scales: int = 3,
+        use_residual: bool = False,
+        residual_proj: bool = True,
+    ):
+        super().__init__()
+        self.backbone = SimpleSAGE(
+            in_channels,
+            hidden_channels=hidden_channels,
+            num_layers=num_layers,
+            use_residual=use_residual,
+            residual_proj=residual_proj,
+            output_dim=hidden_channels,
+        )
+        head_configs = get_default_head_configs(num_scales, hidden_channels)
+        self.scale_labels = [cfg["label"] for cfg in head_configs]
+        self.heads = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
+
+        for cfg in head_configs:
+            hidden_dim = cfg["hidden_channels"]
+            downsample = None
+            if hidden_dim != hidden_channels:
+                downsample = nn.Linear(hidden_channels, hidden_dim)
+            self.downsamples.append(downsample)
+            self.heads.append(MultiScaleHead(hidden_dim, hidden_dim, cfg["mlp_depth"]))
+
+    def forward(self, x, edge_index):
+        base_feat = self.backbone(x, edge_index)
+        outputs = []
+        for downsample, head in zip(self.downsamples, self.heads):
+            h = base_feat if downsample is None else F.relu(downsample(base_feat))
+            outputs.append(head(h))
+        return outputs
 
 # ------------------------------------------------------------
 # CSR Ax
@@ -1436,11 +1547,40 @@ def train_gnn_auto_trainval_pde_weighted(
     num_train = len(cases_train)
     num_val   = len(cases_val)
 
+    scale_labels = get_scale_labels(NUM_SCALES)
+    if len(SCALE_WEIGHTS) < len(scale_labels):
+        scale_weights = SCALE_WEIGHTS + [1.0] * (len(scale_labels) - len(SCALE_WEIGHTS))
+    else:
+        scale_weights = SCALE_WEIGHTS[: len(scale_labels)]
+
+    def _lambda_from_label(label: str, coarse: float, mid: float, fine: float, default: float):
+        if label == "coarse":
+            return coarse
+        if label == "mid":
+            return mid
+        if label == "fine":
+            return fine
+        return default
+
+    lambda_pde_map = {
+        lbl: _lambda_from_label(lbl, LAMBDA_PDE_COARSE, LAMBDA_PDE_MID, LAMBDA_PDE_FINE, LAMBDA_PDE)
+        for lbl in scale_labels
+    }
+    lambda_data_map = {
+        lbl: _lambda_from_label(lbl, LAMBDA_DATA_COARSE, LAMBDA_DATA_MID, LAMBDA_DATA_FINE, LAMBDA_DATA)
+        for lbl in scale_labels
+    }
+    lambda_bc_map = {
+        lbl: _lambda_from_label(lbl, LAMBDA_BC_COARSE, LAMBDA_BC_MID, LAMBDA_BC_FINE, LAMBDA_BC)
+        for lbl in scale_labels
+    }
+
     # --- モデル定義 ---
-    model = SimpleSAGE(
+    model = MultiScaleSAGE(
         in_channels=nFeat,
         hidden_channels=HIDDEN_CHANNELS,
         num_layers=NUM_LAYERS,
+        num_scales=len(scale_labels),
         use_residual=USE_RESIDUAL,
         residual_proj=RESIDUAL_PROJ,
     ).to(device)
@@ -1488,11 +1628,11 @@ def train_gnn_auto_trainval_pde_weighted(
         model.train()
         optimizer.zero_grad()
 
-        total_data_loss = 0.0
-        total_pde_loss  = 0.0
         total_laplacian_loss = torch.tensor(0.0, device=device)
-        total_bc_loss = torch.tensor(0.0, device=device)
         total_gauge_loss = 0.0  # ゲージ損失（教師なし学習時の定数モード抑制用）
+        scale_data_loss_sum = {lbl: torch.tensor(0.0, device=device) for lbl in scale_labels}
+        scale_pde_loss_sum = {lbl: torch.tensor(0.0, device=device) for lbl in scale_labels}
+        scale_bc_loss_sum = {lbl: torch.tensor(0.0, device=device) for lbl in scale_labels}
         sum_rel_err_tr  = 0.0
         sum_R_pred_tr   = 0.0
         sum_rmse_tr     = 0.0
@@ -1528,68 +1668,67 @@ def train_gnn_auto_trainval_pde_weighted(
 
             # AMP: autocast で順伝播と損失計算を FP16/BF16 で実行
             with torch.cuda.amp.autocast(enabled=use_amp_actual):
-                # モデルは正規化スケールで出力
-                x_pred_norm = model(feats_for_model, edge_index)
-                # 非正規化スケールに戻す
-                x_pred = x_pred_norm * x_std_t + x_mean_t
+                x_pred_norm_list = model(feats_for_model, edge_index)
+                if not isinstance(x_pred_norm_list, (list, tuple)):
+                    x_pred_norm_list = [x_pred_norm_list]
+                x_pred_list = [x_pred_norm * x_std_t + x_mean_t for x_pred_norm in x_pred_norm_list]
 
-                # データ損失: x_true がある場合のみ計算
-                if has_x_true and x_true is not None:
-                    # rank ごとの mean/std を用いた x の正規化（data loss 用）
-                    rank_id = int(cs["rank"])
-                    mean_r  = x_mean_rank_t[rank_id]
-                    std_r   = x_std_rank_t[rank_id]
+                main_label = scale_labels[-1]
+                main_x_pred = x_pred_list[-1]
+                R_pred_main = torch.tensor(0.0, device=device)
 
-                    # x_true, x_pred を rank ごとに標準化
-                    x_true_norm_case = (x_true - mean_r) / (std_r + 1e-12)
-                    x_pred_norm_case_for_loss = (x_pred - mean_r) / (std_r + 1e-12)
+                for scale_label, x_pred in zip(scale_labels, x_pred_list):
+                    if has_x_true and x_true is not None:
+                        rank_id = int(cs["rank"])
+                        mean_r  = x_mean_rank_t[rank_id]
+                        std_r   = x_std_rank_t[rank_id]
 
-                    # データ損失: rank ごとに正規化した MSE
-                    data_loss_case = F.mse_loss(
-                        x_pred_norm_case_for_loss,
-                        x_true_norm_case
-                    )
-                    num_cases_with_x += 1
-                else:
-                    # 教師なし学習: データ損失は 0
-                    data_loss_case = torch.tensor(0.0, device=device)
+                        x_true_norm_case = (x_true - mean_r) / (std_r + 1e-12)
+                        x_pred_norm_case_for_loss = (x_pred - mean_r) / (std_r + 1e-12)
 
-                # PDE 損失: w_pde 付き相対残差²
-                Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
-                r  = Ax - b
+                        data_loss_case = F.mse_loss(
+                            x_pred_norm_case_for_loss,
+                            x_true_norm_case
+                        )
+                    else:
+                        data_loss_case = torch.tensor(0.0, device=device)
 
-                sqrt_w = torch.sqrt(w_pde)
-                wr = sqrt_w * r
-                wb = sqrt_w * b
-                norm_wr = torch.norm(wr)
-                norm_wb = torch.norm(wb) + EPS_RES
-                R_pred = norm_wr / norm_wb
-                pde_loss_case = R_pred * R_pred
+                    Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
+                    r  = Ax - b
 
-                # オートディファレンスによるラプラシアン損失
+                    sqrt_w = torch.sqrt(w_pde)
+                    wr = sqrt_w * r
+                    wb = sqrt_w * b
+                    norm_wr = torch.norm(wr)
+                    norm_wb = torch.norm(wb) + EPS_RES
+                    R_pred = norm_wr / norm_wb
+                    pde_loss_case = R_pred * R_pred
+
+                    if USE_BC_LOSS and wall_bc_index is not None and wall_bc_index.numel() > 0:
+                        bc_diff = x_pred[wall_bc_index] - wall_bc_value
+                        bc_loss_case = torch.mean(wall_bc_weight * bc_diff * bc_diff)
+                    else:
+                        bc_loss_case = torch.tensor(0.0, device=device)
+
+                    scale_data_loss_sum[scale_label] = scale_data_loss_sum[scale_label] + data_loss_case
+                    scale_pde_loss_sum[scale_label] = scale_pde_loss_sum[scale_label] + pde_loss_case
+                    scale_bc_loss_sum[scale_label] = scale_bc_loss_sum[scale_label] + bc_loss_case
+
+                    if scale_label == main_label:
+                        R_pred_main = R_pred
+
                 if USE_AUTODIFF_LAPLACIAN_LOSS:
                     laplacian_loss_case = compute_autodiff_laplacian_loss(
-                        x_pred, feats_for_model[:, 0:3], b, w_pde
+                        main_x_pred, feats_for_model[:, 0:3], b, w_pde
                     )
                 else:
                     laplacian_loss_case = torch.tensor(0.0, device=device)
 
-                # ゲージ損失: x_pred の平均値の二乗（教師なし学習時の定数モード抑制用）
-                # 圧力ポアソン方程式の解は定数の不定性（ゲージ自由度）があるため、
-                # 平均ゼロに近づけることで解を一意に定める
-                gauge_loss_case = torch.mean(x_pred) ** 2
+                gauge_loss_case = torch.mean(main_x_pred) ** 2
 
-                # 境界条件損失（WALL_FACES）: Dirichlet を想定し、重み付き MSE
-                if USE_BC_LOSS and wall_bc_index is not None and wall_bc_index.numel() > 0:
-                    bc_diff = x_pred[wall_bc_index] - wall_bc_value
-                    bc_loss_case = torch.mean(wall_bc_weight * bc_diff * bc_diff)
-                else:
-                    bc_loss_case = torch.tensor(0.0, device=device)
-
-            total_data_loss = total_data_loss + data_loss_case
-            total_pde_loss  = total_pde_loss  + pde_loss_case
+            if has_x_true and x_true is not None:
+                num_cases_with_x += 1
             total_laplacian_loss = total_laplacian_loss + laplacian_loss_case
-            total_bc_loss = total_bc_loss + bc_loss_case
             total_gauge_loss = total_gauge_loss + gauge_loss_case
 
             with torch.no_grad():
@@ -1598,7 +1737,7 @@ def train_gnn_auto_trainval_pde_weighted(
                     # ゲージ不変評価: 両者を平均ゼロに正規化してから比較
                     # 圧力ポアソン方程式の解は定数の不定性があるため、
                     # 公平な比較のために平均を引いてから誤差を計算
-                    x_pred_centered = x_pred - torch.mean(x_pred)
+                    x_pred_centered = main_x_pred - torch.mean(main_x_pred)
                     x_true_centered = x_true - torch.mean(x_true)
                     diff = x_pred_centered - x_true_centered
                     N = x_true.shape[0]
@@ -1606,7 +1745,7 @@ def train_gnn_auto_trainval_pde_weighted(
                     rmse_case    = torch.sqrt(torch.sum(diff * diff) / N)
                     sum_rel_err_tr += rel_err_case.item()
                     sum_rmse_tr    += rmse_case.item()
-                sum_R_pred_tr  += R_pred.detach().item()
+                sum_R_pred_tr  += R_pred_main.detach().item()
 
             # 遅延ロードの場合、GPU メモリを解放
             if USE_LAZY_LOADING:
@@ -1615,31 +1754,44 @@ def train_gnn_auto_trainval_pde_weighted(
                     torch.cuda.empty_cache()
 
         # 損失の計算（教師なし学習の場合は PDE 損失 + ゲージ損失）
-        total_pde_loss = total_pde_loss / num_train
+        avg_pde_loss_per_scale = {lbl: scale_pde_loss_sum[lbl] / num_train for lbl in scale_labels}
+        avg_bc_loss_per_scale = {lbl: scale_bc_loss_sum[lbl] / num_train for lbl in scale_labels}
+        if unsupervised_mode or num_cases_with_x == 0:
+            avg_data_loss_per_scale = {lbl: torch.tensor(0.0, device=device) for lbl in scale_labels}
+        else:
+            avg_data_loss_per_scale = {lbl: scale_data_loss_sum[lbl] / num_cases_with_x for lbl in scale_labels}
+
+        total_pde_loss_weighted = sum(
+            scale_weights[idx] * lambda_pde_map[lbl] * avg_pde_loss_per_scale[lbl]
+            for idx, lbl in enumerate(scale_labels)
+        )
+        total_bc_loss_weighted = sum(
+            scale_weights[idx] * lambda_bc_map[lbl] * avg_bc_loss_per_scale[lbl]
+            for idx, lbl in enumerate(scale_labels)
+        )
+        total_data_loss_weighted = sum(
+            scale_weights[idx] * lambda_data_map[lbl] * avg_data_loss_per_scale[lbl]
+            for idx, lbl in enumerate(scale_labels)
+        )
+
         if USE_AUTODIFF_LAPLACIAN_LOSS:
             total_laplacian_loss = total_laplacian_loss / num_train
-        if USE_BC_LOSS:
-            total_bc_loss = total_bc_loss / num_train
         total_gauge_loss = total_gauge_loss / num_train
+
         laplacian_term = (
             LAMBDA_LAPLACIAN * total_laplacian_loss
             if USE_AUTODIFF_LAPLACIAN_LOSS
             else torch.tensor(0.0, device=device)
         )
         bc_term = (
-            LAMBDA_BC * total_bc_loss
+            total_bc_loss_weighted
             if USE_BC_LOSS
             else torch.tensor(0.0, device=device)
         )
         if unsupervised_mode or num_cases_with_x == 0:
-            # 教師なし学習: PDE 損失 + ゲージ正則化
-            # ゲージ正則化は圧力ポアソンの定数モード（ゲージ自由度）を抑制
-            total_data_loss = torch.tensor(0.0, device=device)
-            loss = LAMBDA_PDE * total_pde_loss + laplacian_term + bc_term + LAMBDA_GAUGE * total_gauge_loss
+            loss = total_pde_loss_weighted + laplacian_term + bc_term + LAMBDA_GAUGE * total_gauge_loss
         else:
-            # 教師あり学習: データ損失 + PDE 損失（ゲージ正則化は不要、x_true が定数モードを固定）
-            total_data_loss = total_data_loss / num_cases_with_x
-            loss = LAMBDA_DATA * total_data_loss + LAMBDA_PDE * total_pde_loss + laplacian_term + bc_term
+            loss = total_data_loss_weighted + total_pde_loss_weighted + laplacian_term + bc_term
 
         # AMP: スケーリングされた勾配で逆伝播
         scaler.scale(loss).backward()
@@ -1678,8 +1830,10 @@ def train_gnn_auto_trainval_pde_weighted(
                     has_x_true = cs_gpu.get("has_x_true", x_true is not None)
 
                     with torch.cuda.amp.autocast(enabled=use_amp_actual):
-                        x_pred_norm = model(feats, edge_index)
-                        x_pred = x_pred_norm * x_std_t + x_mean_t
+                        x_pred_norm_list = model(feats, edge_index)
+                        if not isinstance(x_pred_norm_list, (list, tuple)):
+                            x_pred_norm_list = [x_pred_norm_list]
+                        x_pred = x_pred_norm_list[-1] * x_std_t + x_mean_t
 
                     # rel_err, RMSE: x_true がある場合のみ計算
                     if has_x_true and x_true is not None:
@@ -1770,8 +1924,10 @@ def train_gnn_auto_trainval_pde_weighted(
                         has_x_true = cs_gpu.get("has_x_true", x_true is not None)
 
                         with torch.cuda.amp.autocast(enabled=use_amp_actual):
-                            x_pred_norm = model(feats, edge_index)
-                            x_pred = x_pred_norm * x_std_t + x_mean_t
+                            x_pred_norm_list = model(feats, edge_index)
+                            if not isinstance(x_pred_norm_list, (list, tuple)):
+                                x_pred_norm_list = [x_pred_norm_list]
+                            x_pred = x_pred_norm_list[-1] * x_std_t + x_mean_t
 
                         # rel_err, RMSE: x_true がある場合のみ計算
                         if has_x_true and x_true is not None:
@@ -1812,8 +1968,8 @@ def train_gnn_auto_trainval_pde_weighted(
             # 履歴に追加
             history["epoch"].append(epoch)
             history["loss"].append(loss.item())
-            history["data_loss"].append((LAMBDA_DATA * total_data_loss).item())
-            history["pde_loss"].append((LAMBDA_PDE * total_pde_loss).item())
+            history["data_loss"].append(total_data_loss_weighted.item())
+            history["pde_loss"].append(total_pde_loss_weighted.item())
             history["laplacian_loss"].append(laplacian_term.item())
             history["bc_loss"].append(bc_term.item())
             history["gauge_loss"].append((LAMBDA_GAUGE * total_gauge_loss).item())
@@ -1828,8 +1984,8 @@ def train_gnn_auto_trainval_pde_weighted(
             log = (
                 f"[Epoch {epoch:5d}] loss={loss.item():.4e}, "
                 f"lr={current_lr:.3e}, "
-                f"data_loss={LAMBDA_DATA * total_data_loss:.4e}, "
-                f"PDE_loss={LAMBDA_PDE * total_pde_loss:.4e}, "
+                f"data_loss={total_data_loss_weighted:.4e}, "
+                f"PDE_loss={total_pde_loss_weighted:.4e}, "
             )
             if USE_AUTODIFF_LAPLACIAN_LOSS:
                 log += f"laplacian_loss={laplacian_term:.4e}, "
@@ -1915,8 +2071,10 @@ def train_gnn_auto_trainval_pde_weighted(
 
         with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=use_amp_actual):
-                x_pred_norm = model(feats, edge_index)
-                x_pred = x_pred_norm * x_std_t + x_mean_t
+                x_pred_norm_list = model(feats, edge_index)
+                if not isinstance(x_pred_norm_list, (list, tuple)):
+                    x_pred_norm_list = [x_pred_norm_list]
+                x_pred = x_pred_norm_list[-1] * x_std_t + x_mean_t
 
             # 学習で使った weighted PDE 残差
             Ax_pred_w = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
@@ -2058,21 +2216,23 @@ def train_gnn_auto_trainval_pde_weighted(
 
             with torch.no_grad():
                 with torch.cuda.amp.autocast(enabled=use_amp_actual):
-                    x_pred_norm = model(feats, edge_index)
-                    x_pred = x_pred_norm * x_std_t + x_mean_t
+                    x_pred_norm_list = model(feats, edge_index)
+                    if not isinstance(x_pred_norm_list, (list, tuple)):
+                        x_pred_norm_list = [x_pred_norm_list]
+                    x_pred = x_pred_norm_list[-1] * x_std_t + x_mean_t
 
-                Ax_pred_w = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
-                r_pred_w  = Ax_pred_w - b
-                sqrt_w    = torch.sqrt(w_pde)
-                wr_pred   = sqrt_w * r_pred_w
-                wb        = sqrt_w * b
-                norm_wr   = torch.norm(wr_pred)
-                norm_wb   = torch.norm(wb) + EPS_RES
-                R_pred_w  = norm_wr / norm_wb
+                    Ax_pred_w = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
+                    r_pred_w  = Ax_pred_w - b
+                    sqrt_w    = torch.sqrt(w_pde)
+                    wr_pred   = sqrt_w * r_pred_w
+                    wb        = sqrt_w * b
+                    norm_wr   = torch.norm(wr_pred)
+                    norm_wb   = torch.norm(wb) + EPS_RES
+                    R_pred_w  = norm_wr / norm_wb
 
-                Ax_pred = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
-                r_pred  = Ax_pred - b
-                norm_r_pred    = torch.norm(r_pred)
+                    Ax_pred = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
+                    r_pred  = Ax_pred - b
+                    norm_r_pred    = torch.norm(r_pred)
                 max_abs_r_pred = torch.max(torch.abs(r_pred))
                 norm_b         = torch.norm(b)
                 norm_Ax_pred   = torch.norm(Ax_pred)
@@ -2217,6 +2377,18 @@ if __name__ == "__main__":
         action="store_false",
         help="入出力次元が異なるときの残差射影を行わない",
     )
+    parser.add_argument(
+        "--num-scales",
+        type=int,
+        default=NUM_SCALES,
+        help="マルチスケール出力ヘッドの数（>=1）",
+    )
+    parser.add_argument(
+        "--scale-weights",
+        type=str,
+        default=None,
+        help="スケール別損失重みをカンマ区切りで指定 (例: 1.0,0.5,1.0)",
+    )
 
     args = parser.parse_args()
 
@@ -2225,6 +2397,11 @@ if __name__ == "__main__":
     FOURIER_K = max(0, args.fourier_k)
     USE_RESIDUAL = args.use_residual
     RESIDUAL_PROJ = args.residual_proj
+    NUM_SCALES = max(1, args.num_scales)
+    if args.scale_weights:
+        SCALE_WEIGHTS = parse_scale_weights(args.scale_weights, NUM_SCALES)
+    else:
+        SCALE_WEIGHTS = [1.0] * NUM_SCALES
 
     train_gnn_auto_trainval_pde_weighted(DATA_DIR)
 

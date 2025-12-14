@@ -80,7 +80,26 @@ python GNN_train_val_weight.py --use-residual --no-residual-proj
   \mathcal{L}_{\text{lap}} = \frac{\|\sqrt{w_{pde}}\, r_{\Delta}\|_2^2}{\|\sqrt{w_{pde}}\, b\|_2^2 + \varepsilon}
   \]
 
-総損失は利用モードに応じて、`LAMBDA_*` で重み付けした線形和として組み合わせます。
+### マルチスケール損失
+モデルは coarse/mid/fine など複数スケールのヘッドを持ち、スケールごとに異なるダウンサンプリングと MLP 深さで出力を計算します。総損失は
+
+\[
+\mathcal{L}_{\text{total}} = \sum_{s \in \text{scales}} w_s \left( \lambda^{(s)}_{\text{data}} \mathcal{L}^{(s)}_{\text{data}} + \lambda^{(s)}_{\text{PDE}} \mathcal{L}^{(s)}_{\text{PDE}} + \lambda^{(s)}_{\text{bc}} \mathcal{L}^{(s)}_{\text{bc}} \right) + \lambda_{\text{lap}} \mathcal{L}_{\text{lap}} + \lambda_{\text{gauge}} \mathcal{L}_{\text{gauge}}
+\]
+
+とし、`w_s` は `--scale-weights` で指定するスケール別重みです。教師なしの場合はデータ損失項が 0 になり、`\lambda_{\text{gauge}}` のみ最終ヘッドに適用されます。
+
+#### 使い方例
+
+```bash
+# coarse/mid/fine の3スケールで学習し、PDE/BC/data 損失を (0.5, 1.0, 2.0) で重み付け
+python GNN_train_val_weight.py \
+  --num-scales 3 \
+  --scale-weights 0.5,1.0,2.0 \
+  --use-residual
+```
+
+スケール数を 1 に設定すれば従来と同じ単一ヘッドとして動作します。必要に応じて `LAMBDA_*_COARSE/MID/FINE` を編集することでスケール固有の係数も変更できます。
 
 ## 学習・評価フロー
 1. `find_time_rank_list` でデータを収集し、`TRAIN_FRACTION` に従って train/val に分割。
