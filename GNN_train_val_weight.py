@@ -67,6 +67,10 @@ USE_AMP = True            # 混合精度学習（Automatic Mixed Precision）を
 USE_DATA_CACHE = True     # データをキャッシュファイルに保存し、2回目以降は高速ロード
 CACHE_DIR = ".cache"      # キャッシュファイルの保存先ディレクトリ
 
+# Fourier 特徴量オプション
+FOURIER_FEATURES = False  # 座標に対する Fourier 特徴量を追加するかどうか
+FOURIER_K = 4             # 追加する周波数の最大次数（k=1..FOURIER_K）
+
 LAMBDA_DATA = 0.1
 LAMBDA_PDE  = 0.0001
 LAMBDA_LAPLACIAN = 0.0001  # オートディファレンスで計算したラプラシアン損失の重み
@@ -692,6 +696,38 @@ def build_w_pde_from_feats(feats_np: np.ndarray,
 
     return w_clipped.astype(np.float32)
 
+
+# ------------------------------------------------------------
+# Fourier 特徴量生成
+# ------------------------------------------------------------
+
+def append_fourier_features(rc: dict, k_max: int) -> None:
+    """座標に基づく Fourier 特徴量を feats_np に追加する。
+
+    同じ k_max で既に追加済みの場合はスキップする。
+    """
+    if k_max <= 0:
+        return
+
+    if rc.get("_fourier_k_applied") == k_max:
+        return
+
+    base_dim = rc.get("_base_feat_dim", rc["feats_np"].shape[1])
+    feats_np = rc["feats_np"][:, :base_dim]
+    rc["_base_feat_dim"] = base_dim
+
+    coords = feats_np[:, 0:3]
+
+    fourier_list = []
+    for k in range(1, k_max + 1):
+        phase = 2 * np.pi * k * coords
+        fourier_list.append(np.sin(phase))
+        fourier_list.append(np.cos(phase))
+
+    if fourier_list:
+        rc["feats_np"] = np.concatenate([feats_np] + fourier_list, axis=1).astype(np.float32)
+        rc["_fourier_k_applied"] = k_max
+
 # ------------------------------------------------------------
 # raw_case → torch case への変換ヘルパ
 # ------------------------------------------------------------
@@ -1152,9 +1188,27 @@ def train_gnn_auto_trainval_pde_weighted(
             rc = load_case_with_csr(g, t, r)
             raw_cases_all.append(rc)
 
+        if FOURIER_FEATURES and FOURIER_K > 0:
+            for rc in raw_cases_all:
+                append_fourier_features(rc, FOURIER_K)
+
         # キャッシュに保存
         if USE_DATA_CACHE:
             save_raw_cases_to_cache(raw_cases_all, cache_path)
+
+    if not FOURIER_FEATURES:
+        for rc in raw_cases_all:
+            base_dim = rc.get("_base_feat_dim", rc["feats_np"].shape[1])
+            rc["feats_np"] = rc["feats_np"][:, :base_dim]
+            rc["_fourier_k_applied"] = None
+
+    # Fourier 特徴量を追加（要求された場合）
+    if FOURIER_FEATURES and FOURIER_K > 0:
+        for rc in raw_cases_all:
+            append_fourier_features(rc, FOURIER_K)
+        log_print(
+            f"[INFO] Fourier 特徴量を追加: k=1..{FOURIER_K}, nFeatures -> {raw_cases_all[0]['feats_np'].shape[1]}"
+        )
 
     # train/val に分割
     raw_cases_train = []
@@ -2040,5 +2094,31 @@ def train_gnn_auto_trainval_pde_weighted(
         return history
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="GNN PINN Trainer")
+    parser.add_argument(
+        "--data-dir",
+        default=DATA_DIR,
+        help="学習データを含むディレクトリ (default: ./data)",
+    )
+    parser.add_argument(
+        "--fourier-features",
+        action="store_true",
+        help="座標に対する Fourier 特徴量 (sin/cos) を追加して学習する",
+    )
+    parser.add_argument(
+        "--fourier-k",
+        type=int,
+        default=FOURIER_K,
+        help="Fourier 特徴量に使用する最大周波数 k (k=1..K)",
+    )
+
+    args = parser.parse_args()
+
+    DATA_DIR = args.data_dir
+    FOURIER_FEATURES = args.fourier_features
+    FOURIER_K = max(0, args.fourier_k)
+
     train_gnn_auto_trainval_pde_weighted(DATA_DIR)
 

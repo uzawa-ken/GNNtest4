@@ -23,6 +23,20 @@ python GNN_train_val_weight.py
 ```
 主なハイパーパラメータやフラグはスクリプト冒頭で定義されています（例：`DATA_DIR`, `NUM_EPOCHS`, `LR`）。
 
+Fourier 特徴量を座標に付加する場合は、以下のフラグを指定します（未指定なら従来と同じ入力次元で学習します）。
+
+```bash
+python GNN_train_val_weight.py --fourier-features --fourier-k 4
+```
+
+追加する Fourier 特徴量は、各周波数 `k = 1..K` について座標ベクトル \(\mathbf{x}\) に対し
+
+\[
+\big[\sin(2\pi k \mathbf{x}),\ \cos(2\pi k \mathbf{x})\big]
+\]
+
+を生成し既存ノード特徴に連結します（自動で入力次元が拡張されます）。
+
 ## 損失関数と物理拘束
 ここでは主要な損失を数式でまとめます。`\hat{x}` はモデル出力、`x` は教師データ、`b` は RHS、`A` は疎行列、`w_{pde}` はメッシュ品質ベースの重み、`N` はサンプル数を表します。
 
