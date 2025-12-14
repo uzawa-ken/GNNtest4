@@ -52,6 +52,9 @@ MAX_NUM_CASES  = 100   # 自動検出した time のうち先頭 MAX_NUM_CASES �
 TRAIN_FRACTION = 0.8   # 全ケースのうち train に使う割合
 HIDDEN_CHANNELS = 64
 NUM_LAYERS      = 4
+# 残差接続オプション
+USE_RESIDUAL = False         # 各層出力に入力を加える残差パスを使用するか
+RESIDUAL_PROJ = True         # 入出力次元が異なる場合に 1x1 線形で合わせるか
 
 # 学習率スケジューラ（ReduceLROnPlateau）用パラメータ
 USE_LR_SCHEDULER = True
@@ -562,18 +565,91 @@ def load_case_with_csr(gnn_dir: str, time_str: str, rank_str: str):
 # ------------------------------------------------------------
 
 class SimpleSAGE(nn.Module):
-    def __init__(self, in_channels: int, hidden_channels: int = 64, num_layers: int = 4):
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int = 64,
+        num_layers: int = 4,
+        use_residual: bool = False,
+        residual_proj: bool = True,
+    ):
         super().__init__()
+        self.use_residual = use_residual
+        self.residual_proj = residual_proj
         self.convs = nn.ModuleList()
-        self.convs.append(SAGEConv(in_channels, hidden_channels))
-        for _ in range(num_layers - 2):
-            self.convs.append(SAGEConv(hidden_channels, hidden_channels))
-        self.convs.append(SAGEConv(hidden_channels, 1))
+        self.res_proj = nn.ModuleDict()
+
+        in_dims = [in_channels] + [hidden_channels] * (num_layers - 1)
+        out_dims = [hidden_channels] * (num_layers - 1) + [1]
+
+        for idx, (in_dim, out_dim) in enumerate(zip(in_dims, out_dims)):
+            self.convs.append(SAGEConv(in_dim, out_dim))
+            if self.use_residual and self.residual_proj and in_dim != out_dim:
+                self.res_proj[str(idx)] = nn.Linear(in_dim, out_dim, bias=False)
+
+    def _apply_residual(self, x, residual, layer_idx: int):
+        if not self.use_residual:
+            return x
+
+        if residual.shape[-1] != x.shape[-1]:
+            proj = self.res_proj.get(str(layer_idx))
+            if proj is None:
+                return x  # 次元が合わない場合はスキップ
+            residual = proj(residual)
+
+        return x + residual
 
     def forward(self, x, edge_index):
         for i, conv in enumerate(self.convs):
+            residual = x
             x = conv(x, edge_index)
+            x = self._apply_residual(x, residual, i)
             if i != len(self.convs) - 1:
+                x = F.relu(x)
+        return x.view(-1)
+
+
+class SimpleMLP(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int = 64,
+        num_layers: int = 4,
+        use_residual: bool = False,
+        residual_proj: bool = True,
+    ):
+        super().__init__()
+        self.use_residual = use_residual
+        self.residual_proj = residual_proj
+        self.layers = nn.ModuleList()
+        self.res_proj = nn.ModuleDict()
+
+        in_dims = [in_channels] + [hidden_channels] * (num_layers - 1)
+        out_dims = [hidden_channels] * (num_layers - 1) + [1]
+
+        for idx, (in_dim, out_dim) in enumerate(zip(in_dims, out_dims)):
+            self.layers.append(nn.Linear(in_dim, out_dim))
+            if self.use_residual and self.residual_proj and in_dim != out_dim:
+                self.res_proj[str(idx)] = nn.Linear(in_dim, out_dim, bias=False)
+
+    def _apply_residual(self, x, residual, layer_idx: int):
+        if not self.use_residual:
+            return x
+
+        if residual.shape[-1] != x.shape[-1]:
+            proj = self.res_proj.get(str(layer_idx))
+            if proj is None:
+                return x
+            residual = proj(residual)
+
+        return x + residual
+
+    def forward(self, x):
+        for i, lin in enumerate(self.layers):
+            residual = x
+            x = lin(x)
+            x = self._apply_residual(x, residual, i)
+            if i != len(self.layers) - 1:
                 x = F.relu(x)
         return x.view(-1)
 
@@ -1365,6 +1441,8 @@ def train_gnn_auto_trainval_pde_weighted(
         in_channels=nFeat,
         hidden_channels=HIDDEN_CHANNELS,
         num_layers=NUM_LAYERS,
+        use_residual=USE_RESIDUAL,
+        residual_proj=RESIDUAL_PROJ,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = None
@@ -2113,12 +2191,40 @@ if __name__ == "__main__":
         default=FOURIER_K,
         help="Fourier 特徴量に使用する最大周波数 k (k=1..K)",
     )
+    parser.add_argument(
+        "--use-residual",
+        dest="use_residual",
+        action="store_true",
+        default=USE_RESIDUAL,
+        help="各層に入力を足し戻す残差接続を有効化する",
+    )
+    parser.add_argument(
+        "--no-residual",
+        dest="use_residual",
+        action="store_false",
+        help="残差接続を無効化する",
+    )
+    parser.add_argument(
+        "--residual-proj",
+        dest="residual_proj",
+        action="store_true",
+        default=RESIDUAL_PROJ,
+        help="入出力次元が異なるとき 1x1 線形で残差を射影する",
+    )
+    parser.add_argument(
+        "--no-residual-proj",
+        dest="residual_proj",
+        action="store_false",
+        help="入出力次元が異なるときの残差射影を行わない",
+    )
 
     args = parser.parse_args()
 
     DATA_DIR = args.data_dir
     FOURIER_FEATURES = args.fourier_features
     FOURIER_K = max(0, args.fourier_k)
+    USE_RESIDUAL = args.use_residual
+    RESIDUAL_PROJ = args.residual_proj
 
     train_gnn_auto_trainval_pde_weighted(DATA_DIR)
 
