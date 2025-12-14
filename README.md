@@ -23,10 +23,31 @@ python GNN_train_val_weight.py
 主なハイパーパラメータやフラグはスクリプト冒頭で定義されています（例：`DATA_DIR`, `NUM_EPOCHS`, `LR`）。
 
 ## 損失関数と物理拘束
-- **データ損失**：教師ありモード時に rank ごとの標準化 MSE を計算（`LAMBDA_DATA`）。
-- **PDE 損失**：メッシュ品質に基づく重み `w_pde` を用いた相対残差²（`LAMBDA_PDE`）。
-- **ゲージ損失**：教師なし学習時に解の定数モードを抑える平均値ペナルティ（`LAMBDA_GAUGE`）。
-- **自動微分ラプラシアン損失（オプション）**：座標勾配から直接ラプラシアンを計算し、RHS と比較する相対残差²（`USE_AUTODIFF_LAPLACIAN_LOSS`, `LAMBDA_LAPLACIAN`）。
+ここでは主要な損失を数式でまとめます。`\hat{x}` はモデル出力、`x` は教師データ、`b` は RHS、`A` は疎行列、`w_{pde}` はメッシュ品質ベースの重み、`N` はサンプル数を表します。
+
+- **データ損失**（教師ありのみ）：rank ごとに標準化した MSE を計算し、その平均を用います。
+  \[
+  \mathcal{L}_{\text{data}} = \frac{1}{N}\sum_{i=1}^N \big\|\text{standardize}(\hat{x}_i) - \text{standardize}(x_i)\big\|_2^2
+  \]
+
+- **PDE 損失**：疎行列を使った残差を重み付きで相対化します。
+  \[
+  r = A\hat{x} - b, \qquad
+  \mathcal{L}_{\text{PDE}} = \frac{\|\sqrt{w_{pde}}\, r\|_2^2}{\|\sqrt{w_{pde}}\, b\|_2^2 + \varepsilon}
+  \]
+
+- **ゲージ損失**（教師なしのみ）：圧力の定数不定性を抑制するために平均をゼロへ近づけます。
+  \[
+  \mathcal{L}_{\text{gauge}} = \big(\text{mean}(\hat{x})\big)^2
+  \]
+
+- **自動微分ラプラシアン損失（オプション）**：座標勾配から直接ラプラシアンを評価し、RHS と比較する相対残差をとります。
+  \[
+  r_{\Delta} = \nabla^2 \hat{x} - b, \qquad
+  \mathcal{L}_{\text{lap}} = \frac{\|\sqrt{w_{pde}}\, r_{\Delta}\|_2^2}{\|\sqrt{w_{pde}}\, b\|_2^2 + \varepsilon}
+  \]
+
+総損失は利用モードに応じて、`LAMBDA_*` で重み付けした線形和として組み合わせます。
 
 ## 学習・評価フロー
 1. `find_time_rank_list` でデータを収集し、`TRAIN_FRACTION` に従って train/val に分割。
