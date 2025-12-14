@@ -15,6 +15,7 @@ CUDA を利用する場合は、対応する PyTorch / PyTorch Geometric をイ�
 - `pEqn_{time}_rank{rank}.dat` : スカラー場 RHS
 - `A_csr_{time}.dat` または `A_csr_{time}_rank{rank}.dat` : PDE の疎行列
 - `x_{time}_rank{rank}.dat` : 教師あり学習時の真値（教師なしの場合は省略可）
+- `WALL_FACES ...` セクション : 境界セル ID と境界値（および任意の重み）。`pEqn_*` 内で検出されると Dirichlet 境界損失に利用されます。
 
 ## 実行方法
 ```bash
@@ -34,6 +35,11 @@ python GNN_train_val_weight.py
   \[
   r = A\hat{x} - b, \qquad
   \mathcal{L}_{\text{PDE}} = \frac{\|\sqrt{w_{pde}}\, r\|_2^2}{\|\sqrt{w_{pde}}\, b\|_2^2 + \varepsilon}
+  \]
+
+- **境界条件損失（WALL_FACES がある場合）**：境界セルの Dirichlet 条件を明示的に重み付き MSE で拘束します。
+  \[
+  \mathcal{L}_{\text{bc}} = \frac{1}{N_{\text{bc}}}\sum_{i \in \text{WALL\_FACES}} w_i \big(\hat{x}_i - x_i^{\text{bc}}\big)^2
   \]
 
 - **ゲージ損失**（教師なしのみ）：圧力の定数不定性を抑制するために平均をゼロへ近づけます。
