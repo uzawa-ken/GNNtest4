@@ -37,6 +37,19 @@ python GNN_train_val_weight.py --fourier-features --fourier-k 4
 
 を生成し既存ノード特徴に連結します（自動で入力次元が拡張されます）。
 
+### 残差接続の利用
+`--use-residual` を指定すると、各 GNN/MLP ブロックに入力を足し戻す残差パスが有効になります。入出力次元が一致しない層に対しては、`--residual-proj` により 1x1 線形射影を通してから加算するかどうかを制御できます（デフォルト ON）。
+
+```bash
+# 残差あり + 次元合わせも有効
+python GNN_train_val_weight.py --use-residual --residual-proj
+
+# 残差は有効だが、次元射影は行わない
+python GNN_train_val_weight.py --use-residual --no-residual-proj
+```
+
+残差接続を使うことで深いネットワークでも勾配が伝播しやすくなり、特徴次元が変わる層では 1x1 線形射影を挟むことでスムーズに足し戻せます。必要に応じて off にすれば、従来のストレートな層構成での学習も試すことができます。
+
 ## 損失関数と物理拘束
 ここでは主要な損失を数式でまとめます。`\hat{x}` はモデル出力、`x` は教師データ、`b` は RHS、`A` は疎行列、`w_{pde}` はメッシュ品質ベースの重み、`N` はサンプル数を表します。
 
